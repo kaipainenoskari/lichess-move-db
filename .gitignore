@@ -1,0 +1,28 @@
+# Build
+/target/
+
+# Local config (copy from config.example.yaml)
+config.yaml
+
+# Data and DBs
+data/
+*.db
+*.db-wal
+*.db-shm
+*.pgn
+*.pgn.zst
+
+# Secrets / env
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE (optional: remove if you want to commit shared settings)
+.idea/
+.vscode/

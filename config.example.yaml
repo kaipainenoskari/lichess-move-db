@@ -1,0 +1,36 @@
+# Lichess FEN frequency service — example config
+# Copy to config.yaml and adjust paths.
+
+# URL that returns one PGN.zst URL per line (e.g. monthly files)
+lichess_list_url: "https://database.lichess.org/standard/list.txt"
+
+# Directory for downloaded .pgn.zst files
+data_dir: "./data/pgn"
+
+# Output SQLite database path (ignored when database_url is set)
+output_db: "./data/fen_move.db"
+
+# Optional: use PostgreSQL instead of SQLite for run/query/serve
+# database_url: "postgresql://user:password@localhost:5432/fen_move"
+
+# Rating band width in Elo (e.g. 100 → bands 1200, 1300, …, 2500)
+rating_band_width: 100
+
+# Only emit positions where side-to-move rating is in this range (keeps DB smaller)
+rating_min: 1200
+rating_max: 2500
+
+# Include games whose Event tag contains any of these strings.
+# Lichess standard DB uses e.g. "Rated Blitz game", "Rated Rapid game", "Rated Classical game"
+time_controls:
+  - "Rated Blitz game"
+  - "Rated Rapid game"
+
+# Which months to consider: "all", "since YYYY-MM", or leave unset and use CLI --since / only unprocessed
+months: "since 2024-01"
+
+# Whether to run download step when running the pipeline (default: true)
+download: true
+
+# Number of PGN files to process in parallel (default: 1)
+concurrency: 1
