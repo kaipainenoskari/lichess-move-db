@@ -82,7 +82,13 @@ After the run, the tool prints timing and an extrapolated duration for a full mo
 cargo run --release -- run --config config.yaml --sample 50000
 ```
 
-Example output:
+You can also add a benchmark tag; when `--bench-tag TAG` is provided, each run appends a CSV line to `data/benchmarks.csv`:
+
+```bash
+cargo run --release -- run --config config.yaml --sample 50000 --bench-tag before-optimization
+```
+
+Example output (stderr):
 
 ```
 Sample mode: processing at most 50000 games from most recent month (.../lichess_db_standard_rated_2025-01.pgn.zst)
@@ -152,13 +158,52 @@ If `--db` contains `://`, it is treated as a database URL (PostgreSQL); otherwis
 - **Same process**: Open the SQLite file (or Postgres connection) and call the same query logic (e.g. `store::query_moves`).
 - **HTTP**: Run `serve` and call `/query?fen=...&bucket=...`; the response is `{ "moves": [ { "move", "games", "winrate" }, ... ] }`.
 
+### Plugging into getHumanMoves (chess-prep)
+
+To use the **faster local SQLite store** instead of the Lichess API (or instead of PostgreSQL), build the DB with this tool using **SQLite** (do not set `database_url` in config; the DB is written to `output_db`). Then choose one of these:
+
+**Option A: HTTP server (easiest drop-in)**
+
+1. Run the built DB and server:
+   ```bash
+   cargo run --release -- serve --db ./data/fen_move.db --bind 127.0.0.1:8080
+   ```
+2. In chess-prep, point `getHumanMoves` at this server instead of the Lichess API:
+   - **URL**: `GET http://localhost:8080/query?fen=<FEN>&bucket=<bucket>`
+   - **Example**: `GET http://localhost:8080/query?fen=r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R%20w%20KQkq%20-&bucket=1600-1800`
+   - **Response** (same shape as Lichess Explorer / `GetHumanMovesResult`):
+     ```json
+     { "moves": [ { "move": "f1c4", "games": 12345, "winrate": 0.52 }, ... ] }
+     ```
+   - Use the same FEN normalization (6 fields, trimmed) and bucket string (e.g. `1600-1800`) as you do for the API. The server uses `band_width=100` by default; pass `--band-width 100` when starting `serve` if you built the DB with a different width.
+
+**Option B: Direct SQLite from chess-prep**
+
+If your app can read a local SQLite file (e.g. Node with `better-sqlite3`, or Electron/desktop), open the same `output_db` path and run the query yourself:
+
+- **Table**: `fen_move_stats` — columns `fen`, `rating_band`, `move`, `games`, `wins`, `draws`.
+- **Bucket → bands**: For bucket `"1600-1800"` and `band_width` 100, use bands `1600, 1700, 1800` (grid-aligned: low = floor(low/width)*width, high = floor(high/width)*width, then step by `band_width`).
+- **SQL** (parameterized):
+  ```sql
+  SELECT move, SUM(games) AS games, SUM(wins) AS wins, SUM(draws) AS draws
+  FROM fen_move_stats
+  WHERE fen = ? AND rating_band IN (?, ?, ...)
+  GROUP BY move
+  ORDER BY games DESC
+  ```
+- **Winrate** (per row): `winrate = (wins + draws * 0.5) / games` (for the side to move, in [0, 1]).
+- **Response shape**: `{ moves: [ { move: "<uci>", games: <number>, winrate: <0–1> }, ... ] }` — same as GetHumanMovesResult.
+
+**Recommendation:** Use **SQLite** for the app-facing store (your benchmarks show it’s much faster than Postgres for this workload). Build the DB with this repo without `database_url`, then either run `serve --db <path>` and call the HTTP endpoint from getHumanMoves, or open the SQLite file directly in chess-prep and run the query above.
+
 ## Performance
 
 Full-month runs are I/O and CPU heavy. The pipeline does the following to improve throughput:
 
-- **Bulk writes**: Stats are flushed in batches (default 500k keys) using multi-row `INSERT ... ON CONFLICT` in chunks (SQLite: 100 rows/statement; Postgres: 500 rows/statement) instead of one insert per row.
-- **SQLite**: WAL mode, `synchronous=NORMAL`, and a 256 MB cache during ingest to speed up bulk load.
-- **PostgreSQL**: Often faster for large ingest due to better concurrent write and indexing; use `database_url` in config.
+- **Bulk writes**: Stats are flushed in batches (default 1M keys) using multi-row `INSERT ... ON CONFLICT` in chunks (SQLite: 100 rows/statement; Postgres: 500 rows/statement) instead of one insert per row.
+- **SQLite bulk load**: Ingest uses PRAGMA synchronous=OFF and defers the fen+rating index until after all data is written (index dropped at start, recreated at end). Query/serve use a normal connection with the index.
+- **SQLite read path**: WAL, synchronous=NORMAL, large cache when opening for query or serve.
+- **PostgreSQL**: Use database_url if you prefer; if benchmarks show it much slower than SQLite for ingest, use SQLite and the HTTP server.
 
 To get higher games/second:
 

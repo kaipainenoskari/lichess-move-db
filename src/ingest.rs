@@ -9,9 +9,11 @@ use crate::store_postgres;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::fs::OpenOptions;
+use std::io::Write;
 
-const FLUSH_THRESHOLD: usize = 500_000;
+const FLUSH_THRESHOLD: usize = 1_000_000;
 /// Typical games per Lichess standard month (for extrapolation in sample mode).
 const TYPICAL_GAMES_PER_MONTH: u64 = 90_000_000;
 
@@ -38,8 +40,9 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
         (DbBackend::Postgres(pool), skip)
     } else {
         std::fs::create_dir_all(config.output_db.parent().unwrap_or(Path::new(".")))?;
-        let conn = store::open_connection(&config.output_db)?;
+        let conn = store::open_connection_for_bulk_load(&config.output_db)?;
         store::ensure_schema(&conn)?;
+        store::drop_fen_rating_index_if_exists(&conn)?;
         manifest::ensure_table(&conn)?;
         let skip = if args.force {
             vec![]
@@ -106,6 +109,10 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut total_games: u64 = 0;
+    let mut total_elapsed = Duration::from_secs(0);
+    let mut total_db: Duration = Duration::from_secs(0);
+
     for path in paths {
         let month = path
             .file_stem()
@@ -121,6 +128,7 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
 
         eprintln!("Processing {} ...", path.display());
         let start = Instant::now();
+        let db_before = total_db;
         let mut agg: HashMap<(String, u32, String), (u64, u64, u64)> = HashMap::new();
 
         let games_processed = {
@@ -136,7 +144,7 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
                 e.2 += record.draws;
 
                 if agg.len() >= FLUSH_THRESHOLD {
-                    flush_agg(&backend, &mut agg);
+                    flush_agg(&backend, &mut agg, &mut total_db);
                 }
             };
             pgn::process_file(
@@ -150,11 +158,27 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
             )?
         };
 
-        flush_agg(&backend, &mut agg);
+        flush_agg(&backend, &mut agg, &mut total_db);
         let elapsed = start.elapsed();
+        total_games += games_processed;
+        total_elapsed += elapsed;
+        let file_db = total_db
+            .checked_sub(db_before)
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let file_parse = elapsed
+            .checked_sub(file_db)
+            .unwrap_or_else(|| Duration::from_secs(0));
 
         if sample_mode {
             eprintln!("  Processed {} games in {:.1?}", games_processed, elapsed);
+            if elapsed.as_secs_f64() > 0.0 {
+                let db_pct = 100.0 * file_db.as_secs_f64() / elapsed.as_secs_f64();
+                let parse_pct = 100.0 * file_parse.as_secs_f64() / elapsed.as_secs_f64();
+                eprintln!(
+                    "  Time breakdown: parse+decompress {:.1?} ({:.0}%), DB writes {:.1?} ({:.0}%)",
+                    file_parse, parse_pct, file_db, db_pct
+                );
+            }
             if games_processed > 0 && elapsed.as_secs_f64() > 0.0 {
                 let games_per_sec = games_processed as f64 / elapsed.as_secs_f64();
                 let extrapolated_secs = TYPICAL_GAMES_PER_MONTH as f64 / games_per_sec;
@@ -174,12 +198,20 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
         }
     }
 
+    if let DbBackend::Sqlite(ref conn) = backend {
+        eprintln!("Creating fen+rating index (one-time after ingest)...");
+        store::ensure_fen_rating_index(conn)?;
+    }
+
+    maybe_log_benchmark(config, args, &backend, total_games, total_elapsed, total_db);
+
     Ok(())
 }
 
 fn flush_agg(
     backend: &DbBackend,
     agg: &mut HashMap<(String, u32, String), (u64, u64, u64)>,
+    total_db: &mut Duration,
 ) {
     if agg.is_empty() {
         return;
@@ -188,6 +220,7 @@ fn flush_agg(
         .drain()
         .map(|((fen, band, move_uci), (games, wins, draws))| (fen, band, move_uci, games, wins, draws))
         .collect();
+    let start = Instant::now();
     match backend {
         DbBackend::Sqlite(conn) => {
             if let Err(e) = store::upsert_batch(conn, &rows) {
@@ -204,11 +237,83 @@ fn flush_agg(
             }
         }
     }
+    *total_db += start.elapsed();
 }
 
 async fn mark_processed(backend: &DbBackend, month: &str) -> Result<()> {
     match backend {
         DbBackend::Sqlite(conn) => manifest::mark_processed(conn, month),
         DbBackend::Postgres(pool) => store_postgres::mark_processed(pool, month).await,
+    }
+}
+
+fn maybe_log_benchmark(
+    config: &Config,
+    args: &RunArgs,
+    backend: &DbBackend,
+    total_games: u64,
+    total_elapsed: Duration,
+    total_db: Duration,
+) {
+    if total_games == 0 {
+        return;
+    }
+    let Some(tag) = args.bench_tag.as_ref() else {
+        return;
+    };
+    let secs = total_elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return;
+    }
+    let games_per_sec = total_games as f64 / secs;
+    let db_secs = total_db.as_secs_f64();
+    let parse_secs = (total_elapsed
+        .checked_sub(total_db)
+        .unwrap_or_else(|| Duration::from_secs(0)))
+    .as_secs_f64();
+    let backend_name = match backend {
+        DbBackend::Sqlite(_) => "sqlite",
+        DbBackend::Postgres(_) => "postgres",
+    };
+    let ts = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => 0,
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+        eprintln!("Warning: could not create benchmark dir: {}", e);
+        return;
+    }
+    let path = config.data_dir.join("benchmarks.csv");
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not open benchmark log {}: {}",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    let sample_games = args.sample.unwrap_or(0);
+    let line = format!(
+        "{ts},{backend},{sample},{games},{secs:.3},{db_secs:.3},{parse_secs:.3},{gps:.1},{tag}\n",
+        backend = backend_name,
+        sample = sample_games,
+        games = total_games,
+        secs = secs,
+        db_secs = db_secs,
+        parse_secs = parse_secs,
+        gps = games_per_sec,
+        tag = tag,
+    );
+    if let Err(e) = file.write_all(line.as_bytes()) {
+        eprintln!("Warning: could not write benchmark log: {}", e);
     }
 }

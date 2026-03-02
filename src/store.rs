@@ -23,7 +23,28 @@ fn open(db_path: &Path) -> Result<Connection> {
 pub fn open_connection(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-256000; PRAGMA temp_store=MEMORY;")?;
+    ensure_fen_rating_index(&conn)?;
     Ok(conn)
+}
+
+/// Opens a connection tuned for bulk ingest (faster writes, no index until finalize).
+/// Use only for the ingest pipeline; for query/serve use open_connection.
+pub fn open_connection_for_bulk_load(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; PRAGMA cache_size=-256000; PRAGMA temp_store=MEMORY;")?;
+    Ok(conn)
+}
+
+/// Creates the fen+rating index (call after bulk load so writes are faster).
+pub fn ensure_fen_rating_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_fen_rating ON fen_move_stats(fen, rating_band);")?;
+    Ok(())
+}
+
+/// Drops the fen+rating index so bulk ingest doesn't pay index update cost. Call at start of ingest.
+pub fn drop_fen_rating_index_if_exists(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP INDEX IF EXISTS idx_fen_rating;")?;
+    Ok(())
 }
 
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -38,7 +59,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             draws INTEGER NOT NULL,
             PRIMARY KEY (fen, rating_band, move)
         );
-        CREATE INDEX IF NOT EXISTS idx_fen_rating ON fen_move_stats(fen, rating_band);
         "#,
     )?;
     Ok(())

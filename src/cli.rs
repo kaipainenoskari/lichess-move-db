@@ -34,6 +34,11 @@ pub struct RunArgs {
     /// Does not mark the month as processed. Prints timing and extrapolated duration for a full month.
     #[arg(long)]
     pub sample: Option<u64>,
+
+    /// Optional benchmark tag; when set, the run appends a CSV row to data/benchmarks.csv
+    /// with timing and throughput information.
+    #[arg(long)]
+    pub bench_tag: Option<String>,
 }
 
 #[derive(clap::Args)]
