@@ -6,7 +6,9 @@
 
 ---
 
-## 1. Staging table (append-only ingest, then merge) — **highest impact**
+## 1. Staging table (append-only ingest, then merge) — **implemented**
+
+**Implementation:** SQLite and Postgres use `fen_move_staging`; each flush (every 1M keys) does `insert_batch_staging` then `merge_staging_into_fen_move_stats` (see `store.rs`, `store_postgres.rs`, `ingest.rs`).
 
 **Idea:** Stop upserting into `fen_move_stats` during parse. Instead:
 

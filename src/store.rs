@@ -64,10 +64,25 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// SQLite default limit is 999 bound parameters per statement; 100 rows × 6 cols = 600.
-const SQLITE_CHUNK: usize = 100;
+/// Append-only staging table for Phase 1 ingest (no PK, no index).
+pub fn ensure_staging_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS fen_move_staging (
+            fen TEXT NOT NULL,
+            rating_band INTEGER NOT NULL,
+            move TEXT NOT NULL,
+            games INTEGER NOT NULL,
+            wins INTEGER NOT NULL,
+            draws INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
 
-pub fn upsert_batch(conn: &Connection, rows: &[(String, u32, String, u64, u64, u64)]) -> Result<()> {
+/// Append-only insert into staging (no ON CONFLICT). Call merge_staging_into_fen_move_stats after.
+pub fn insert_batch_staging(conn: &Connection, rows: &[(String, u32, String, u64, u64, u64)]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -81,11 +96,7 @@ pub fn upsert_batch(conn: &Connection, rows: &[(String, u32, String, u64, u64, u
             })
             .collect();
         let sql = format!(
-            "INSERT INTO fen_move_stats (fen, rating_band, move, games, wins, draws) VALUES {}
-             ON CONFLICT(fen, rating_band, move) DO UPDATE SET
-                games = games + excluded.games,
-                wins = wins + excluded.wins,
-                draws = draws + excluded.draws",
+            "INSERT INTO fen_move_staging (fen, rating_band, move, games, wins, draws) VALUES {}",
             placeholders.join(", ")
         );
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 6);
@@ -102,6 +113,27 @@ pub fn upsert_batch(conn: &Connection, rows: &[(String, u32, String, u64, u64, u
     tx.commit()?;
     Ok(())
 }
+
+/// Merge staging into fen_move_stats (GROUP BY + ON CONFLICT), then clear staging.
+pub fn merge_staging_into_fen_move_stats(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        INSERT INTO fen_move_stats (fen, rating_band, move, games, wins, draws)
+        SELECT fen, rating_band, move, SUM(games), SUM(wins), SUM(draws)
+        FROM fen_move_staging
+        GROUP BY fen, rating_band, move
+        ON CONFLICT(fen, rating_band, move) DO UPDATE SET
+            games = fen_move_stats.games + excluded.games,
+            wins = fen_move_stats.wins + excluded.wins,
+            draws = fen_move_stats.draws + excluded.draws;
+        DELETE FROM fen_move_staging;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// SQLite default limit is 999 bound parameters per statement; 100 rows × 6 cols = 600.
+const SQLITE_CHUNK: usize = 100;
 
 /// Resolve bucket "1600-1800" to bands [1600, 1700, 1800] (grid-aligned).
 pub fn bucket_to_bands(bucket: &str, band_width: u32) -> Result<Vec<u32>> {

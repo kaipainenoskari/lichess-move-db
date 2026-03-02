@@ -31,6 +31,7 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
             .connect(url)
             .await?;
         store_postgres::ensure_schema(&pool).await?;
+        store_postgres::ensure_staging_table(&pool).await?;
         store_postgres::ensure_manifest_table(&pool).await?;
         let skip = if args.force {
             vec![]
@@ -42,6 +43,7 @@ pub async fn run_pipeline(config: &Config, args: &RunArgs) -> Result<()> {
         std::fs::create_dir_all(config.output_db.parent().unwrap_or(Path::new(".")))?;
         let conn = store::open_connection_for_bulk_load(&config.output_db)?;
         store::ensure_schema(&conn)?;
+        store::ensure_staging_table(&conn)?;
         store::drop_fen_rating_index_if_exists(&conn)?;
         manifest::ensure_table(&conn)?;
         let skip = if args.force {
@@ -223,17 +225,22 @@ fn flush_agg(
     let start = Instant::now();
     match backend {
         DbBackend::Sqlite(conn) => {
-            if let Err(e) = store::upsert_batch(conn, &rows) {
-                eprintln!("Warning: flush failed: {}", e);
+            if let Err(e) = store::insert_batch_staging(conn, &rows) {
+                eprintln!("Warning: staging insert failed: {}", e);
+            } else if let Err(e) = store::merge_staging_into_fen_move_stats(conn) {
+                eprintln!("Warning: merge staging failed: {}", e);
             }
         }
         DbBackend::Postgres(pool) => {
             let pool = pool.clone();
             let rows = rows;
             if let Err(e) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(store_postgres::upsert_batch(&pool, &rows))
+                tokio::runtime::Handle::current().block_on(async {
+                    store_postgres::insert_batch_staging(&pool, &rows).await?;
+                    store_postgres::merge_staging_into_fen_move_stats(&pool).await
+                })
             }) {
-                eprintln!("Warning: flush failed: {}", e);
+                eprintln!("Warning: staging/merge failed: {}", e);
             }
         }
     }

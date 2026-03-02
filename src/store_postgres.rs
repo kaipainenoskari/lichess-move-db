@@ -29,6 +29,88 @@ pub async fn ensure_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Append-only staging table for Phase 1 ingest.
+pub async fn ensure_staging_table(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fen_move_staging (
+            fen TEXT NOT NULL,
+            rating_band INTEGER NOT NULL,
+            move TEXT NOT NULL,
+            games BIGINT NOT NULL,
+            wins BIGINT NOT NULL,
+            draws BIGINT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Chunk size for multi-row INSERT.
+const PG_CHUNK: usize = 500;
+
+/// Append-only insert into staging. Call merge_staging_into_fen_move_stats after.
+pub async fn insert_batch_staging(
+    pool: &PgPool,
+    rows: &[(String, u32, String, u64, u64, u64)],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for chunk in rows.chunks(PG_CHUNK) {
+        let n = chunk.len();
+        let mut placeholders = Vec::with_capacity(n);
+        let mut param = 1i32;
+        for _ in 0..n {
+            placeholders.push(format!(
+                "(${},{},{},{},{},{})",
+                param, param + 1, param + 2, param + 3, param + 4, param + 5
+            ));
+            param += 6;
+        }
+        let sql = format!(
+            "INSERT INTO fen_move_staging (fen, rating_band, move, games, wins, draws) VALUES {}",
+            placeholders.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for (fen, band, move_, games, wins, draws) in chunk {
+            query = query
+                .bind(fen)
+                .bind(*band as i32)
+                .bind(move_)
+                .bind(*games as i64)
+                .bind(*wins as i64)
+                .bind(*draws as i64);
+        }
+        query.execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Merge staging into fen_move_stats, then truncate staging.
+pub async fn merge_staging_into_fen_move_stats(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fen_move_stats (fen, rating_band, move, games, wins, draws)
+        SELECT fen, rating_band, move, SUM(games), SUM(wins), SUM(draws)
+        FROM fen_move_staging
+        GROUP BY fen, rating_band, move
+        ON CONFLICT (fen, rating_band, move) DO UPDATE SET
+            games = fen_move_stats.games + excluded.games,
+            wins = fen_move_stats.wins + excluded.wins,
+            draws = fen_move_stats.draws + excluded.draws
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("TRUNCATE fen_move_staging").execute(pool).await?;
+    Ok(())
+}
+
 pub async fn ensure_manifest_table(pool: &PgPool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS processed_months (month TEXT PRIMARY KEY)",
@@ -50,49 +132,6 @@ pub async fn mark_processed(pool: &PgPool, month: &str) -> Result<()> {
         .bind(month)
         .execute(pool)
         .await?;
-    Ok(())
-}
-
-/// Chunk size for multi-row INSERT (keeps param count reasonable).
-const PG_CHUNK: usize = 500;
-
-pub async fn upsert_batch(
-    pool: &PgPool,
-    rows: &[(String, u32, String, u64, u64, u64)],
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut tx = pool.begin().await?;
-    for chunk in rows.chunks(PG_CHUNK) {
-        let n = chunk.len();
-        let mut placeholders = Vec::with_capacity(n);
-        let mut param = 1i32;
-        for _ in 0..n {
-            placeholders.push(format!("(${},{},{},{},{},{})", param, param + 1, param + 2, param + 3, param + 4, param + 5));
-            param += 6;
-        }
-        let sql = format!(
-            "INSERT INTO fen_move_stats (fen, rating_band, move, games, wins, draws) VALUES {}
-             ON CONFLICT (fen, rating_band, move) DO UPDATE SET
-                games = fen_move_stats.games + excluded.games,
-                wins = fen_move_stats.wins + excluded.wins,
-                draws = fen_move_stats.draws + excluded.draws",
-            placeholders.join(", ")
-        );
-        let mut query = sqlx::query(&sql);
-        for (fen, band, move_, games, wins, draws) in chunk {
-            query = query
-                .bind(fen)
-                .bind(*band as i32)
-                .bind(move_)
-                .bind(*games as i64)
-                .bind(*wins as i64)
-                .bind(*draws as i64);
-        }
-        query.execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
     Ok(())
 }
 
