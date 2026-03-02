@@ -183,3 +183,27 @@ pub async fn query_moves(
         .collect();
     Ok(QueryResult { moves })
 }
+
+/// Returns (distinct_fens, total_rows, total_games) for fen_move_stats.
+pub async fn db_stats(pool: &PgPool) -> Result<(u64, u64, u64)> {
+    let distinct_fens: i64 = sqlx::query_scalar::<sqlx::Postgres, i64>("SELECT COUNT(DISTINCT fen) FROM fen_move_stats")
+        .fetch_one(pool)
+        .await?;
+    let total_rows: i64 = sqlx::query_scalar::<sqlx::Postgres, i64>("SELECT COUNT(*) FROM fen_move_stats")
+        .fetch_one(pool)
+        .await?;
+    let total_games: i64 = sqlx::query_scalar::<sqlx::Postgres, i64>("SELECT COALESCE(SUM(games), 0) FROM fen_move_stats")
+        .fetch_one(pool)
+        .await?;
+    Ok(
+        (distinct_fens.max(0) as u64, total_rows.max(0) as u64, total_games.max(0) as u64)
+    )
+}
+
+/// Clears all data (fen_move_stats, fen_move_staging, processed_months). Schema is left in place.
+pub async fn flush_db(pool: &PgPool) -> Result<()> {
+    sqlx::query("TRUNCATE fen_move_stats, fen_move_staging, processed_months")
+        .execute(pool)
+        .await?;
+    Ok(())
+}

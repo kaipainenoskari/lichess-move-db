@@ -216,3 +216,21 @@ pub fn query_moves(
     }
     Ok(QueryResult { moves })
 }
+
+/// Returns (distinct_fens, total_rows, total_games) for fen_move_stats.
+pub fn db_stats(db_path: &Path) -> Result<(u64, u64, u64)> {
+    let conn = open(db_path)?;
+    let distinct_fens: u64 = conn.query_row("SELECT COUNT(DISTINCT fen) FROM fen_move_stats", [], |r| r.get(0))?;
+    let total_rows: u64 = conn.query_row("SELECT COUNT(*) FROM fen_move_stats", [], |r| r.get(0))?;
+    let total_games: i64 = conn.query_row("SELECT COALESCE(SUM(games), 0) FROM fen_move_stats", [], |r| r.get(0))?;
+    Ok((distinct_fens, total_rows, total_games.max(0) as u64))
+}
+
+/// Clears all data (fen_move_stats, fen_move_staging, processed_months). Schema is left in place.
+pub fn flush_db(db_path: &Path) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("DELETE FROM fen_move_stats; DELETE FROM processed_months;")?;
+    // Staging may not exist on DBs created before Phase 1
+    let _ = conn.execute_batch("DELETE FROM fen_move_staging;");
+    Ok(())
+}

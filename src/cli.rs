@@ -10,6 +10,24 @@ pub enum Commands {
     Query(QueryArgs),
     /// Run HTTP server for query API (for chess-prep app integration)
     Serve(ServeArgs),
+    /// Print DB stats: distinct FENs, total rows, total games (for sanity-check / sample runs)
+    Stats(StatsArgs),
+    /// Clear all data from the DB (stats, staging, processed months). Schema kept; use to start fresh.
+    Flush(FlushArgs),
+}
+
+#[derive(clap::Args)]
+pub struct FlushArgs {
+    /// Path to SQLite database, or PostgreSQL URL
+    #[arg(long, short)]
+    pub db: String,
+}
+
+#[derive(clap::Args)]
+pub struct StatsArgs {
+    /// Path to SQLite database, or PostgreSQL URL
+    #[arg(long, short)]
+    pub db: String,
 }
 
 #[derive(clap::Args)]
@@ -95,4 +113,31 @@ pub async fn query(args: QueryArgs) -> Result<()> {
 
 pub async fn serve(args: ServeArgs) -> Result<()> {
     crate::server::serve(&args.db, &args.bind, args.band_width).await
+}
+
+pub async fn stats(args: StatsArgs) -> Result<()> {
+    if args.db.contains("://") {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&args.db)
+            .await?;
+        let (fens, rows, games) = crate::store_postgres::db_stats(&pool).await?;
+        println!("distinct_fens\t{}\ntotal_rows\t{}\ntotal_games\t{}", fens, rows, games);
+    } else {
+        let (fens, rows, games) = crate::store::db_stats(std::path::Path::new(&args.db))?;
+        println!("distinct_fens\t{}\ntotal_rows\t{}\ntotal_games\t{}", fens, rows, games);
+    }
+    Ok(())
+}
+
+pub async fn flush(args: FlushArgs) -> Result<()> {
+    if args.db.contains("://") {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&args.db)
+            .await?;
+        crate::store_postgres::flush_db(&pool).await?;
+    } else {
+        crate::store::flush_db(std::path::Path::new(&args.db))?;
+    }
+    eprintln!("DB flushed. All data cleared; schema unchanged.");
+    Ok(())
 }

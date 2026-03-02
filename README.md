@@ -100,6 +100,34 @@ Processing .../lichess_db_standard_rated_2025-01.pgn.zst ...
 
 Use a value that runs for a couple of minutes (e.g. 30k–100k games depending on your machine) to get a stable estimate.
 
+**Re-running sample mode:** The month is never marked processed, so each `--sample` run re-processes the same games and **adds** their counts into the DB. If you run `--sample 50000` five times, positions from those games will have roughly 5× the game counts. To get clean one-time sample data, use a fresh DB (e.g. delete or rename `output_db`) before a single sample run.
+
+## Stats (CLI)
+
+Print how much data is in the DB (distinct FENs, total rows, total games):
+
+```bash
+cargo run --release -- stats --db ./data/fen_move.db
+```
+
+With PostgreSQL URL:
+
+```bash
+cargo run --release -- stats --db "postgresql://user:pass@localhost:5432/fen_move"
+```
+
+Output: `distinct_fens`, `total_rows`, `total_games` (one per line, tab-separated). Use this to sanity-check after sample runs or to see how many positions you have.
+
+## Flush (CLI)
+
+Clear all data from the DB so you can start fresh. Tables and schema are left in place; only rows are removed.
+
+```bash
+cargo run --release -- flush --db ./data/fen_move.db
+```
+
+With PostgreSQL URL: `flush --db "postgresql://user:pass@localhost:5432/fen_move"`. After flushing, run the pipeline again to repopulate.
+
 ## Query (CLI)
 
 Get move stats for a FEN and rating bucket (output is JSON to stdout):

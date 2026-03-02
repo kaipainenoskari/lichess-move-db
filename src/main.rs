@@ -27,5 +27,7 @@ async fn main() -> Result<()> {
         Commands::Run(args) => cli::run(args).await,
         Commands::Query(args) => cli::query(args).await,
         Commands::Serve(args) => cli::serve(args).await,
+        Commands::Stats(args) => cli::stats(args).await,
+        Commands::Flush(args) => cli::flush(args).await,
     }
 }
